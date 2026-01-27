@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import fsspec
 import pytest
@@ -10,27 +9,6 @@ from . import cmr_to_stac, emit_load, to_zarr_spec
 from .vendor.eosdis_store.dmrpp import to_zarr
 
 # pylint: disable=redefined-outer-name
-
-
-@pytest.fixture
-def data_dir():
-    yield Path(__file__).parent / "test_data"
-
-
-@pytest.fixture
-def cmr_sample(data_dir):
-    path = data_dir / "emit_l2a_rfl_sample.cmr.json"
-    with open(path, "rt", encoding="utf8") as f:
-        doc = json.load(f)
-    yield doc
-
-
-@pytest.fixture
-def dmrpp_sample(data_dir):
-    path = data_dir / "emit_l2a_rfl_sample.dmrpp"
-    with open(path, "rt", encoding="utf8") as f:
-        doc = f.read()
-    yield doc
 
 
 def test_cmr(cmr_sample, dmrpp_sample):
@@ -57,6 +35,16 @@ def test_cmr(cmr_sample, dmrpp_sample):
     assert isinstance(xx, xr.Dataset)
     assert "ortho_x" in xx.dims
     assert "ortho_y" in xx.coords
+
+
+def test_cmr_partial(cmr_sample_partial, dmrpp_sample):
+    for dmrpp in (None, dmrpp_sample):
+        doc = cmr_to_stac(cmr_sample_partial, dmrpp)
+        assert "id" in doc
+        item = Item.from_dict(doc)
+
+        assert len(item.assets) == 0
+        assert item.datetime is not None
 
 
 def test_dmrpp(dmrpp_sample):
@@ -105,12 +93,12 @@ def test_to_zarr_spec(dmrpp_sample, mode, url):
         assert "lon/.zarray" in spec
         assert "history" not in _json(".zattrs")
         assert "geotransform" not in _json(".zattrs")
-        assert _json("reflectance/.zattrs")["coordinates"] == "lon lat wavelengths"
-        assert _json("reflectance/.zattrs")["_ARRAY_DIMENSIONS"] == ["y", "x", "band"]
+        assert _json("reflectance/.zattrs")["coordinates"] == "lon lat wavelength"
+        assert _json("reflectance/.zattrs")["_ARRAY_DIMENSIONS"] == ["y", "x", "wavelength"]
 
-        assert set(xx.data_vars) == set(["reflectance", "good_wavelengths", "fwhm", "elev", "glt_x", "glt_y"])
-        assert set(xx.dims) == set(["y", "x", "band", "ortho_x", "ortho_y"])
-        assert set(xx.coords) == set(["lat", "lon", "wavelengths"])
+        assert set(xx.data_vars) == set(["reflectance", "good_wavelength", "fwhm", "elev", "glt_x", "glt_y"])
+        assert set(xx.dims) == set(["y", "x", "wavelength", "ortho_x", "ortho_y"])
+        assert set(xx.coords) == set(["lat", "lon", "wavelength"])
         assert xx.lon.shape == xx.lat.shape
         assert xx.lon.shape == xx.reflectance.shape[:2]
-        assert xx.reflectance.shape[-1] == xx.good_wavelengths.shape[0]
+        assert xx.reflectance.shape[-1] == xx.good_wavelength.shape[0]

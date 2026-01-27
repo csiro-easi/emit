@@ -1,7 +1,8 @@
 import asyncio
 import json
 from base64 import b64decode, b64encode
-from typing import Any, Iterable, Iterator, Literal
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Literal
 
 import zarr.convenience as zc
 from odc.geo import MaybeCRS, geom, wh_, xy_
@@ -10,6 +11,7 @@ from odc.geo.xr import xr_coords
 from toolz import get_in
 
 from ._creds import prep_s3_fs
+from .assets import EMIT_WAVELENGTH_BYTES
 from .vendor.eosdis_store.dmrpp import to_zarr
 
 __all__ = ["cmr_to_stac"]
@@ -46,6 +48,10 @@ class Cfg:
     gsd = 60
     default_pt_idx = (2, 3, 0, 1)
 
+    fixed_chunks: dict[str, bytes] = {
+        "wavelength/0": EMIT_WAVELENGTH_BYTES,
+    }
+
 
 def emit_id(url: str, postfix: str = "") -> str:
     *_, _dir, _ = url.split("/")
@@ -78,11 +84,13 @@ def is_chunk_key(k: str) -> bool:
 
 
 def _do_edits(refs):
-    dims = {"downtrack": "y", "crosstrack": "x", "bands": "band"}
+    dims = {"downtrack": "y", "crosstrack": "x", "bands": "wavelength"}
+    var_renames = {"wavelengths": "wavelength", "good_wavelengths": "good_wavelength"}
+
     coords = {
         ("y", "x"): "lon lat",
-        ("band",): "wavelengths",
-        ("y", "x", "band"): "lon lat wavelengths",
+        ("wavelength",): "wavelength",
+        ("y", "x", "wavelength"): "lon lat wavelength",
     }
     drop_vars = set(["build_dmrpp_metadata"])
     drop_ds_attrs = set(["history"])
@@ -121,6 +129,8 @@ def _do_edits(refs):
         if group in flatten_groups:
             k = k[len(group) + 1 :]
 
+        group, *rest = k.split("/", 1)
+        k = "/".join([var_renames.get(group, group), *rest])
         return (k, doc)
 
     return dict(edit_one(k, doc) for k, doc in refs.items() if _keep(k))
@@ -159,14 +169,19 @@ def to_zarr_spec(
     mode: ZarrSpecMode = "default",
     footprint: geom.Geometry | None = None,
 ) -> tuple[dict[str, Any], GCPGeoBox | None]:
-    def to_docs(zz: dict[str, Any]) -> Iterator[tuple[str, str | tuple[str | None, int, int]]]:
+    def to_docs(zz: dict[str, Any]) -> Iterator[tuple[str, str | bytes | tuple[str | None, int, int]]]:
         # sorted keys are needed to work around problem in fsspec directory listing 1430
         for k in sorted(zz, key=lambda p: (p.count("/"), p)):
             doc = zz[k]
             if k.endswith("/.zchunkstore"):
                 prefix, _ = k.rsplit("/", 1)
                 for chunk_key, info in doc.items():
-                    yield f"{prefix}/{chunk_key}", (url, info["offset"], info["size"])
+                    ck = f"{prefix}/{chunk_key}"
+                    fixed = Cfg.fixed_chunks.get(ck, None)
+                    if fixed is not None:
+                        yield ck, fixed
+                    else:
+                        yield ck, (url, info["offset"], info["size"])
             else:
                 yield k, json.dumps(doc, separators=(",", ":"))
 
@@ -189,7 +204,7 @@ def to_zarr_spec(
     return spec, gbox
 
 
-def _asset_name_from_url(u):
+def _asset_name_from_url(u: str) -> str:
     return u.rsplit("/", 1)[-1].split("_")[2]
 
 
@@ -219,7 +234,7 @@ def _json_safe_chunk(v):
     return v
 
 
-def _unjson_chunk(v):
+def unjson_chunk(v):
     if isinstance(v, str):
         return b64decode(v.encode("ascii"))
     return v
@@ -236,10 +251,12 @@ def cmr_to_stac(
         cmr = json.loads(cmr)
 
     assert isinstance(cmr, dict)
-    uu = [x["URL"] for x in cmr["RelatedUrls"] if x["Type"] in {"GET DATA VIA DIRECT ACCESS"}]
+    related_urls = [x for x in cmr.get("RelatedUrls", []) if "URL" in x and "Type" in x]
 
-    visual_url, *_ = [
-        x["URL"] for x in cmr["RelatedUrls"] if x["URL"].startswith("https:") and x["URL"].endswith(".png")
+    uu = [x["URL"] for x in related_urls if x["Type"] in {"GET DATA VIA DIRECT ACCESS"}]
+
+    visual_url, *_ = [x["URL"] for x in related_urls if x["URL"].startswith("https:") and x["URL"].endswith(".png")] + [
+        ""
     ]
 
     assets = {
@@ -251,16 +268,17 @@ def cmr_to_stac(
         }
         for u in uu
     }
-    assets.update(
-        {
-            "visual": {
-                "href": visual_url,
-                "title": "Visual Preview",
-                "type": "image/png",
-                "roles": ["overview"],
+    if visual_url:
+        assets.update(
+            {
+                "visual": {
+                    "href": visual_url,
+                    "title": "Visual Preview",
+                    "type": "image/png",
+                    "roles": ["overview"],
+                }
             }
-        }
-    )
+        )
 
     dt_range = cmr["TemporalExtent"]["RangeDateTime"]
     footprint = _footprint(cmr, pts_idx)
@@ -281,7 +299,7 @@ def cmr_to_stac(
     }
 
     proj_props: dict[str, Any] = {}
-    if dmrpp_doc is not None:
+    if dmrpp_doc is not None and "RFL" in assets:
         if gcp_crs is None:
             spec, gbox = to_zarr_spec(dmrpp_doc, footprint=footprint)
         else:
@@ -312,7 +330,7 @@ def cmr_to_stac(
             "_ARRAY_DIMENSIONS": [],
             **spatial_ref.attrs,
         }
-        md[".zattrs"]["coordinates"] = " ".join(["spatial_ref", "wavelengths", "lon", "lat"])
+        md[".zattrs"]["coordinates"] = " ".join(["spatial_ref", "wavelength", "lon", "lat"])
 
         chunks = {k: _json_safe_chunk(v) for k, v in spec.items() if is_chunk_key(k)}
         chunks["spatial_ref/0"] = _json_safe_chunk(spatial_ref.data.astype("<i4").tobytes())
@@ -356,7 +374,7 @@ def subchunk_consolidated(
     *,
     factor: int | None = None,
     rows_per_chunk: int | None = None,
-):
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Subchunk consolidated metadata.
 
@@ -461,3 +479,21 @@ async def emit_doc_stream(
                 yield _id, doc
 
     await session.close()
+
+
+def patch_hrefs(doc: dict[str, Any], edit: Callable[[str], str]):
+    for a in doc["assets"].values():
+        if "href" in a:
+            a["href"] = edit(a["href"])
+    return doc
+
+
+def remap_to_local_dir(local_dir: str | Path) -> Callable[[str], str]:
+    if isinstance(local_dir, str):
+        local_dir = Path(local_dir.rstrip("/")).absolute()
+
+    def edit(href: str) -> str:
+        *_, name = href.rsplit("/", 1)
+        return str(local_dir / name)
+
+    return edit
